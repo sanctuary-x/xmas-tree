@@ -587,7 +587,7 @@
         async function initVision() {
             // Check if browser supports camera access
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                document.getElementById('loading').innerText = 'Error: Secure context (HTTPS) required for camera';
+                document.getElementById('loading').innerText = 'Error: Camera access not supported by this browser';
                 return;
             }
 
@@ -624,9 +624,9 @@
                     setTimeout(() => document.getElementById('loading').remove(), 1000);
                 }).catch((error) => {
                     console.error('Camera access error:', error);
-                    if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+                    if (error.name === 'NotAllowedError') {
                         document.getElementById('loading').innerText = 'Error: Camera access denied';
-                    } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+                    } else if (error.name === 'NotFoundError') {
                         document.getElementById('loading').innerText = 'Error: No camera found';
                     } else {
                         document.getElementById('loading').innerText = 'Error: Failed to access camera';
