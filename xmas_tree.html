@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Controlled Xmas Tree</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Helvetica Neue', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-feed { position: absolute; bottom: 20px; right: 20px; width: 160px; height: 120px; transform: scaleX(-1); border-radius: 10px; border: 2px solid #d4af37; opacity: 0.7; z-index: 2; object-fit: cover; }
+        
+        #ui-layer { position: absolute; top: 20px; left: 20px; z-index: 10; color: #d4af37; pointer-events: none; }
+        h1 { margin: 0; font-weight: 100; font-size: 24px; letter-spacing: 2px; text-transform: uppercase; text-shadow: 0 0 10px rgba(212, 175, 55, 0.5); }
+        .status { font-size: 12px; margin-top: 5px; color: #888; }
+        .instruction { font-size: 14px; margin-top: 15px; line-height: 1.6; color: #eee; }
+        .key-point { color: #d4af37; font-weight: bold; }
+        #cursor {
+            position: absolute; width: 30px; height: 30px;
+            border: 3px solid #d4af37; border-radius: 50%;
+            pointer-events: none; z-index: 20; display: none;
+            box-shadow: 0 0 15px #d4af37, inset 0 0 10px rgba(212, 175, 55, 0.5);
+            background-color: rgba(212, 175, 55, 0.1);
+            transition: transform 0.05s linear; 
+            mix-blend-mode: screen; 
+        }
+
+        #upload-btn {
+            pointer-events: auto;
+            background: rgba(212, 175, 55, 0.1);
+            border: 1px solid #d4af37;
+            color: #d4af37;
+            padding: 10px 20px;
+            margin-top: 20px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 12px;
+        }
+
+        #upload-btn:hover { background: #d4af37; color: #000; box-shadow: 0 0 15px #d4af37; }
+        input[type="file"] { display: none; }
+
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 100; display: flex; justify-content: center; align-items: center;
+            color: #d4af37; font-size: 20px; letter-spacing: 4px;
+            transition: opacity 1s;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="loading">INITIALIZING SYSTEM...</div>
+    <div id="cursor"></div>
+
+    <div id="ui-layer">
+        <h1>XMAS MEMORY CLOUD</h1>
+        <div class="status" id="status-text">Waiting for camera...</div>
+        <div class="instruction">
+            <span class="key-point">🖐 Open Hand</span>: Disperse (散开)<br>
+            <span class="key-point">👌 Pinch (Hold)</span>: View Photo (捏住查看)<br>
+            <span class="key-point">✋ Release</span>: Close Photo (松开关闭)<br>
+            <span class="key-point">✊ Fist</span>: Tree Form (合拢)<br>
+            <span class="key-point">👋 Move Hand</span>: Rotate (旋转)<br>
+        </div>
+        <button id="upload-btn" onclick="document.getElementById('file-input').click()">+ Upload Photos</button>
+        <input type="file" id="file-input" multiple accept="image/*">
+    </div>
+
+    <video id="video-feed" playsinline muted autoplay></video>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import TWEEN from 'three/addons/libs/tween.module.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- Configuration ---
+        const CONFIG = {
+            colors: {
+                green: 0x0f2e1a, 
+                gold: 0xffd700,  
+                red: 0x8a0303,   
+                white: 0xffffff
+            },
+            particleCount: 1200, // Increased from 400 for higher density
+            photoCount: 15,     
+            treeHeight: 30,
+            treeRadius: 12
+        };
+
+        // --- State Management ---
+        const STATE = {
+            current: 'TREE', // TREE, CLOUD, FOCUS
+            previousShape: 'TREE', // Track previous shape for return
+            handDetected: false,
+            lastGesture: 'NONE',
+            rotationSpeedY: 0.001,
+            rotationSpeedX: 0,
+            focusedObject: null,
+            cursor: { x: 0.5, y: 0.5 }, // 平滑光标位置
+            hoverTarget: null,          // 当前悬停目标
+            hoverTimer: 0,              // 悬停计时器
+            lastRandomTrigger: 0,
+            dragTarget: new THREE.Vector3(), // Target position for dragging
+            isDragging: false,               // Dragging state
+            cameraTarget: new THREE.Vector3(0, 0, 0), // For lookAt tweening
+            baseCameraPos: new THREE.Vector3(0, 0, 45) // Base camera pos
+        };
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const raycaster = new THREE.Raycaster();
+        const cursor = document.getElementById('cursor');
+        
+        scene.fog = new THREE.FogExp2(0x050505, 0.02);
+        
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 45);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        renderer.toneMapping = THREE.ReinhardToneMapping;
+        container.appendChild(renderer.domElement);
+
+        // --- Post Processing (Bloom) ---
+        const renderScene = new RenderPass(scene, camera);
+        // Optimize: Use half resolution for Bloom to improve performance
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth / 2, window.innerHeight / 2), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0.15; 
+        bloomPass.strength = 2.0;   
+        bloomPass.radius = 0.8;     
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(CONFIG.colors.gold, 2, 100);
+        pointLight.position.set(0, 15, 10);
+        scene.add(pointLight);
+
+        const redLight = new THREE.PointLight(CONFIG.colors.red, 3, 50);
+        redLight.position.set(0, -10, 0);
+        scene.add(redLight);
+
+        // --- Materials ---
+        const matGreen = new THREE.MeshStandardMaterial({ 
+            color: CONFIG.colors.green, roughness: 0.5, metalness: 0.5,
+            emissive: 0x0f4d0f, emissiveIntensity: 2.5 
+        });
+        const matGold = new THREE.MeshStandardMaterial({ 
+            color: CONFIG.colors.gold, roughness: 0.1, metalness: 1.0, 
+            emissive: 0xffaa00, emissiveIntensity: 1.5 
+        });
+        const matRed = new THREE.MeshStandardMaterial({ 
+            color: CONFIG.colors.red, roughness: 0.2, metalness: 0.6,
+            emissive: 0xff0000, emissiveIntensity: 1.2 
+        });
+        const matTrunk = new THREE.MeshStandardMaterial({ 
+            color: 0x8B4513, roughness: 0.8, metalness: 0.2,
+            emissive: 0x5C3317, emissiveIntensity: 1.0 
+        });
+
+        // --- Object Generation ---
+        const objects = [];
+        const objectGroup = new THREE.Group();
+        scene.add(objectGroup);
+
+        // Further reduced particle size for higher density (0.25 -> 0.15, 0.35 -> 0.2)
+        const geoSphere = new THREE.SphereGeometry(0.15, 16, 16);
+        const geoBox = new THREE.BoxGeometry(0.2, 0.2, 0.2);
+        const geoPlane = new THREE.PlaneGeometry(3, 4);
+
+        function createPlaceholderTexture(text) {
+            const cvs = document.createElement('canvas');
+            cvs.width = 256; cvs.height = 340;
+            const ctx = cvs.getContext('2d');
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0,0,256,340);
+            ctx.strokeStyle = '#d4af37';
+            ctx.lineWidth = 5;
+            ctx.strokeRect(5,5,246,330);
+            ctx.fillStyle = '#d4af37';
+            ctx.font = '30px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText("MEMORY", 128, 150);
+            ctx.font = '20px Arial';
+            ctx.fillText(text, 128, 190);
+            
+            const tex = new THREE.CanvasTexture(cvs);
+            return tex;
+        }
+
+        // Initialize Particles
+        function initParticles() {
+            // 1. Create Green Leaves/Ornaments
+            for(let i=0; i<CONFIG.particleCount; i++) {
+                const isGold = Math.random() > 0.8;
+                const isRed = Math.random() > 0.9;
+                
+                let mat = matGreen;
+                let geo = geoBox;
+                
+                if(isGold) { mat = matGold; geo = geoSphere; }
+                else if(isRed) { mat = matRed; geo = geoSphere; }
+
+                const mesh = new THREE.Mesh(geo, mat);
+                
+                // Store target positions
+                mesh.userData = {
+                    treePos: getTreePosition(i, CONFIG.particleCount),
+                    cloudPos: getCloudPosition(),
+                    type: 'particle'
+                };
+                
+                // Start at random cloud pos
+                mesh.position.copy(mesh.userData.treePos);
+                mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, 0);
+                
+                objects.push(mesh);
+                objectGroup.add(mesh);
+            }
+
+            // 1.5 Create Trunk Particles
+            const trunkCount = 150;
+            const trunkHeight = 8;
+            const trunkRadius = 2.5;
+            const trunkStartY = -CONFIG.treeHeight/2; // Bottom of the tree leaves
+
+            for(let i=0; i<trunkCount; i++) {
+                const mesh = new THREE.Mesh(geoBox, matTrunk);
+                
+                // Cylinder distribution
+                const y = trunkStartY - Math.random() * trunkHeight;
+                const r = Math.random() * trunkRadius;
+                const angle = Math.random() * Math.PI * 2;
+                
+                const x = Math.cos(angle) * r;
+                const z = Math.sin(angle) * r;
+                
+                const treePos = new THREE.Vector3(x, y, z);
+                
+                mesh.userData = {
+                    treePos: treePos,
+                    cloudPos: getCloudPosition(60),
+                    type: 'particle'
+                };
+                
+                mesh.position.copy(treePos);
+                mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, 0);
+                
+                objects.push(mesh);
+                objectGroup.add(mesh);
+            }
+
+            // 2. Create Photo Placeholders
+            const borderMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const borderGeo = new THREE.PlaneGeometry(3.2, 4.2); // Slightly larger than photo (3x4)
+
+            for(let i=0; i<CONFIG.photoCount; i++) {
+                const tex = createPlaceholderTexture("#"+(i+1));
+                const mat = new THREE.MeshBasicMaterial({ 
+                    map: tex, 
+                    side: THREE.DoubleSide,
+                    color: 0xaaaaaa // Dim the brightness
+                });
+                
+                // Create Border Mesh
+                const borderMesh = new THREE.Mesh(borderGeo, borderMat);
+                borderMesh.position.z = -0.01; // Slightly behind photo
+
+                const mesh = new THREE.Mesh(geoPlane, mat);
+                mesh.add(borderMesh); // Attach border to photo
+                
+                mesh.userData = {
+                    treePos: getTreePosition(i, CONFIG.photoCount, true), // Outer layer
+                    cloudPos: getCloudPosition(80), // Wider cloud (increased from 40)
+                    type: 'photo',
+                    originalMat: mat
+                };
+
+                mesh.position.copy(mesh.userData.treePos);
+                mesh.lookAt(0, mesh.position.y, 0); // Face center axis
+                mesh.scale.set(0.25, 0.25, 0.25); // Start small as ornaments
+                objects.push(mesh);
+                objectGroup.add(mesh);
+            }
+        }
+
+        function getTreePosition(index, total, isOuter = false) {
+            const h = CONFIG.treeHeight;
+            const r = CONFIG.treeRadius + (isOuter ? 2 : 0);
+            
+            if (isOuter) {
+                // Photos: Random distribution on surface
+                const y = Math.random() * h - h/2;
+                const radiusAtY = r * (1 - (y + h/2)/h);
+                const angle = Math.random() * Math.PI * 2; 
+
+                const x = Math.cos(angle) * radiusAtY;
+                const z = Math.sin(angle) * radiusAtY;
+                return new THREE.Vector3(x, y, z);
+            }
+
+            // Particles: Random distribution for natural look
+            const y = Math.random() * h - h/2;
+            const radiusAtY = r * (1 - (y + h/2)/h);
+            const angle = Math.random() * Math.PI * 2;
+            
+            // Add some depth/randomness to the surface
+            const rVar = radiusAtY * (0.8 + Math.random() * 0.4);
+
+            const x = Math.cos(angle) * rVar;
+            const z = Math.sin(angle) * rVar;
+
+            return new THREE.Vector3(x, y, z);
+        }
+
+        function getCloudPosition(radius = 60) { // Increased default radius from 30 to 60
+            const u = Math.random();
+            const v = Math.random();
+            const theta = 2 * Math.PI * u;
+            const phi = Math.acos(2 * v - 1);
+            
+            const r = radius * Math.cbrt(Math.random()); // Uniform sphere
+            const x = r * Math.sin(phi) * Math.cos(theta);
+            const y = r * Math.sin(phi) * Math.sin(theta);
+            const z = r * Math.cos(phi);
+            
+            return new THREE.Vector3(x, y, z);
+        }
+
+        // --- Animation Logic ---
+        let shapeTween = null;
+        const dummy = new THREE.Object3D();
+
+        function transformShape(shapeType) {
+            if(STATE.current === shapeType) return;
+            
+            // If leaving FOCUS mode, reset the focused object
+            if(STATE.current === 'FOCUS' && STATE.focusedObject) {
+                // Skip transform animation in resetFocus, we will handle it here
+                resetFocus(true); 
+            }
+
+            STATE.current = shapeType;
+
+            if (shapeTween) shapeTween.stop();
+
+            const duration = 2000;
+            const transitionData = [];
+
+            objects.forEach(obj => {
+                if (obj === STATE.focusedObject) return; // Skip focused object (should be null now)
+
+                const targetPos = shapeType === 'TREE' ? obj.userData.treePos : obj.userData.cloudPos;
+                
+                // Calculate Target Rotation & Scale
+                const targetRot = { x: 0, y: 0, z: 0 };
+                let targetScale = { x: 1, y: 1, z: 1 };
+
+                if(shapeType === 'TREE') {
+                    if (obj.userData.type === 'photo') {
+                        // Make photos look at center in tree mode
+                        dummy.position.copy(targetPos);
+                        dummy.lookAt(0, targetPos.y, 0);
+                        targetRot.x = dummy.rotation.x;
+                        targetRot.y = dummy.rotation.y;
+                        targetRot.z = dummy.rotation.z;
+                        
+                        // Shrink photos to become ornaments
+                        targetScale = { x: 0.25, y: 0.25, z: 0.25 };
+                    } else {
+                        // Particles: Keep current rotation to avoid spinning
+                        targetRot.x = obj.rotation.x;
+                        targetRot.y = obj.rotation.y;
+                        targetRot.z = obj.rotation.z;
+                    }
+                } else {
+                    // Random rotation in cloud mode
+                    targetRot.x = Math.random() * Math.PI;
+                    targetRot.y = Math.random() * Math.PI;
+                    targetRot.z = 0;
+                    // Restore scale in cloud mode
+                    if (obj.userData.type === 'photo') {
+                        targetScale = { x: 1, y: 1, z: 1 };
+                    }
+                }
+
+                // Shortest path adjustment for rotation
+                ['x', 'y', 'z'].forEach(axis => {
+                    let d = targetRot[axis] - obj.rotation[axis];
+                    while (d > Math.PI) d -= 2 * Math.PI;
+                    while (d < -Math.PI) d += 2 * Math.PI;
+                    targetRot[axis] = obj.rotation[axis] + d;
+                });
+
+                transitionData.push({
+                    obj: obj,
+                    startPos: obj.position.clone(),
+                    endPos: targetPos,
+                    startRot: { x: obj.rotation.x, y: obj.rotation.y, z: obj.rotation.z },
+                    endRot: targetRot,
+                    startScale: obj.scale.clone(),
+                    endScale: targetScale
+                });
+            });
+
+            const tObj = { t: 0 };
+            
+            shapeTween = new TWEEN.Tween(tObj)
+                .to({ t: 1 }, 2500) // Slower duration
+                .easing(TWEEN.Easing.Cubic.InOut) // Smoother easing
+                .onUpdate(() => {
+                    const t = tObj.t;
+                    for(let i=0; i<transitionData.length; i++) {
+                        const data = transitionData[i];
+                        
+                        // Skip if this object is currently focused (to avoid conflict)
+                        if (data.obj === STATE.focusedObject) continue;
+
+                        // Interpolate Position
+                        data.obj.position.x = data.startPos.x + (data.endPos.x - data.startPos.x) * t;
+                        data.obj.position.y = data.startPos.y + (data.endPos.y - data.startPos.y) * t;
+                        data.obj.position.z = data.startPos.z + (data.endPos.z - data.startPos.z) * t;
+
+                        // Interpolate Rotation
+                        data.obj.rotation.x = data.startRot.x + (data.endRot.x - data.startRot.x) * t;
+                        data.obj.rotation.y = data.startRot.y + (data.endRot.y - data.startRot.y) * t;
+                        data.obj.rotation.z = data.startRot.z + (data.endRot.z - data.startRot.z) * t;
+
+                        // Interpolate Scale
+                        data.obj.scale.x = data.startScale.x + (data.endScale.x - data.startScale.x) * t;
+                        data.obj.scale.y = data.startScale.y + (data.endScale.y - data.startScale.y) * t;
+                        data.obj.scale.z = data.startScale.z + (data.endScale.z - data.startScale.z) * t;
+                    }
+                })
+                .start();
+        }
+
+        function focusPhoto(obj) {
+            if (STATE.focusedObject === obj) return;
+            if (STATE.focusedObject) resetFocus();
+
+            STATE.focusedObject = obj;
+            if (STATE.current !== 'FOCUS') STATE.previousShape = STATE.current;
+            STATE.current = 'FOCUS';
+
+            // Detach to keep it stable in world space while background rotates
+            scene.attach(obj);
+
+            // Calculate World Position (now it's just position since it's direct child of scene)
+            const worldPos = obj.position.clone();
+
+            // Calculate Camera Target Position (8 units away, facing photo)
+            // Use vector from center to object as direction
+            const dir = worldPos.clone().normalize();
+            const camTargetPos = worldPos.clone().add(dir.multiplyScalar(8)); 
+
+            STATE.baseCameraPos.copy(camTargetPos); 
+
+            const duration = 2500; 
+            const easing = TWEEN.Easing.Quintic.InOut; 
+            
+            // Tween Camera Position
+            new TWEEN.Tween(camera.position)
+                .to(camTargetPos, duration)
+                .easing(easing)
+                .start();
+            
+            // Tween LookAt Target
+            new TWEEN.Tween(STATE.cameraTarget)
+                .to(worldPos, duration)
+                .easing(easing)
+                .start();
+                
+            // Tween Object Rotation to face camera exactly
+            const dummy = new THREE.Object3D();
+            dummy.position.copy(worldPos);
+            dummy.lookAt(camTargetPos); 
+            
+            new TWEEN.Tween(obj.quaternion)
+                .to({ x: dummy.quaternion.x, y: dummy.quaternion.y, z: dummy.quaternion.z, w: dummy.quaternion.w }, duration)
+                .easing(easing)
+                .start();
+
+            // Tween Scale to full size (1.0)
+            new TWEEN.Tween(obj.scale)
+                .to({ x: 1, y: 1, z: 1 }, duration)
+                .easing(easing)
+                .start();
+
+            // Tween Color to darker (reduce glare)
+            new TWEEN.Tween(obj.material.color)
+                .to({ r: 0.2, g: 0.2, b: 0.2 }, duration)
+                .easing(easing)
+                .start();
+        }
+
+        function resetFocus(skipTransform = false) {
+            if (!STATE.focusedObject) return;
+            const obj = STATE.focusedObject;
+            
+            // Stop focus tweens
+            if(obj.userData.activeTweens) {
+                obj.userData.activeTweens.forEach(t => t.stop());
+            }
+            obj.userData.activeTweens = [];
+
+            // Re-attach to the rotating group
+            objectGroup.attach(obj);
+
+            // We are about to release control, so clear focusedObject reference immediately
+            STATE.focusedObject = null;
+
+            const duration = 2500; // Slower return
+            const easing = TWEEN.Easing.Cubic.InOut; // Smoother easing
+
+            // Tween Camera Back to Origin
+            new TWEEN.Tween(camera.position)
+                .to({ x: 0, y: 0, z: 45 }, duration)
+                .easing(easing)
+                .start();
+
+            // Tween LookAt Back to Center
+            new TWEEN.Tween(STATE.cameraTarget)
+                .to({ x: 0, y: 0, z: 0 }, duration)
+                .easing(easing)
+                .start();
+
+            // Restore brightness (Always do this)
+            new TWEEN.Tween(obj.material.color)
+                .to({ r: 0.667, g: 0.667, b: 0.667 }, duration) // Restore to 0xaaaaaa
+                .easing(easing)
+                .start();
+
+            if (!skipTransform) {
+                // Return to previous shape position
+                const targetShape = STATE.previousShape || 'TREE';
+                const target = targetShape === 'TREE' ? obj.userData.treePos : obj.userData.cloudPos;
+                
+                // Determine target scale
+                let targetScale = { x: 1, y: 1, z: 1 };
+                if (targetShape === 'TREE' && obj.userData.type === 'photo') {
+                    targetScale = { x: 0.25, y: 0.25, z: 0.25 };
+                }
+
+                new TWEEN.Tween(obj.position).to(target, duration).easing(easing).start();
+                new TWEEN.Tween(obj.scale).to(targetScale, duration).easing(easing).start();
+                
+                // Reset rotation based on mode
+                if (targetShape === 'TREE') {
+                    new TWEEN.Tween(obj.rotation)
+                        .to({ x: 0, y: Math.atan2(target.x, target.z), z: 0 }, duration)
+                        .easing(easing)
+                        .start();
+                }
+                STATE.current = targetShape;
+            }
+        }
+
+        // --- Vision AI Setup ---
+        let handLandmarker = undefined;
+        const video = document.getElementById('video-feed');
+        const statusText = document.getElementById('status-text');
+
+        async function initVision() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1,
+                minHandDetectionConfidence: 0.15, // Extremely lowered for fist detection
+                minHandPresenceConfidence: 0.15, 
+                minTrackingConfidence: 0.15      
+            });
+
+            // Start Camera with optimized constraints
+            const constraints = {
+                video: {
+                    width: { ideal: 640 },
+                    height: { ideal: 480 },
+                    frameRate: { ideal: 30 }
+                }
+            };
+
+            navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", predictWebcam);
+                document.getElementById('loading').style.opacity = 0;
+                setTimeout(() => document.getElementById('loading').remove(), 1000);
+            });
+        }
+
+        let lastVideoTime = -1;
+        let lastPredictionTime = 0;
+        const predictionInterval = 1000 / 30; // Limit to 30 FPS
+
+        function predictWebcam() {
+            const now = performance.now();
+            if (now - lastPredictionTime >= predictionInterval) {
+                if (video.currentTime !== lastVideoTime) {
+                    lastVideoTime = video.currentTime;
+                    lastPredictionTime = now;
+                    
+                    if (handLandmarker) {
+                        const result = handLandmarker.detectForVideo(video, now);
+                        processGesture(result);
+                    }
+                }
+            }
+            requestAnimationFrame(predictWebcam);
+        }
+
+        function processGesture(result) {
+            if (result.landmarks.length > 0) {
+                STATE.handDetected = true;
+                const landmarks = result.landmarks[0];
+                
+                // 1. Robust Finger State Detection
+                const wrist = landmarks[0];
+                
+                // Helper: Check if finger is extended (Tip further from wrist than PIP)
+                // threshold: <1.0 容易判定为伸直, >1.0 难判定为伸直(容易判定为弯曲)
+                const isExtended = (tipIdx, pipIdx, threshold = 1.0) => {
+                    const dTip = Math.hypot(landmarks[tipIdx].x - wrist.x, landmarks[tipIdx].y - wrist.y);
+                    const dPip = Math.hypot(landmarks[pipIdx].x - wrist.x, landmarks[pipIdx].y - wrist.y);
+                    return dTip > dPip * threshold; 
+                };
+
+                // 食指标准调整为 1.1，避免握拳时误判为伸直
+                const indexOpen = isExtended(8, 6, 1.1);
+                const middleOpen = isExtended(12, 10, 1.3);
+                const ringOpen = isExtended(16, 14, 1.3);
+                const pinkyOpen = isExtended(20, 18, 1.3);
+                
+                // 2. Detect Hand Position for Rotation
+                // Only rotate if not in FOCUS mode
+                if (STATE.current !== 'FOCUS') {
+                    const handX = landmarks[9].x; 
+                    const handY = landmarks[9].y;
+                    
+                    STATE.rotationSpeedY = (handX - 0.5) * 0.02;
+                    
+                    // Allow X-axis rotation (tilting) only in CLOUD mode
+                    if (STATE.current === 'CLOUD') {
+                        STATE.rotationSpeedX = (handY - 0.5) * 0.02;
+                    } else {
+                        STATE.rotationSpeedX = 0;
+                    }
+                } else {
+                    STATE.rotationSpeedY = 0;
+                    STATE.rotationSpeedX = 0;
+                }
+
+                // 3. Gesture Logic
+                let gesture = 'NONE';
+
+                // PINCH Detection (Thumb Tip 4 to Index Tip 8)
+                const pinchDist = Math.hypot(landmarks[8].x - landmarks[4].x, landmarks[8].y - landmarks[4].y);
+                // Use a moderate threshold
+                let isPinching = pinchDist < 0.08; 
+
+                // POINT: Index open, others closed
+                // Refined logic: Index tip must be significantly higher than PIP joint
+                if (indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
+                    gesture = 'POINT';
+                } 
+                // OPEN: All 4 main fingers open
+                else if (indexOpen && middleOpen && ringOpen && pinkyOpen) {
+                    gesture = 'OPEN'; 
+                } 
+                // FIST: All 4 main fingers closed
+                // Refined logic: Ensure thumb is not extended too far out
+                else if (!indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
+                    gesture = 'FIST'; 
+                }
+
+                // Prevent Pinch detection if it's a Fist (to avoid accidental trigger when closing hand)
+                if (gesture === 'FIST') isPinching = false;
+
+                // Prioritize PINCH over other gestures if detected
+                if (isPinching) gesture = 'PINCH';
+
+                statusText.innerText = `Gesture: ${gesture} | Speed Y: ${STATE.rotationSpeedY.toFixed(3)}`;
+
+                // Handle Gestures
+                
+                // PINCH: Open Random Photo & Drag
+                if (isPinching) {
+                    STATE.isDragging = true;
+
+                    // Calculate Pinch Center (Normalized 0-1)
+                    const pinchX = (landmarks[8].x + landmarks[4].x) / 2;
+                    const pinchY = (landmarks[8].y + landmarks[4].y) / 2;
+
+                    // Map to World Coordinates at Z=32
+                    // Camera Z=45, Target Z=32 -> Distance = 13
+                    // FOV=60 -> vHeight = 2 * tan(30) * 13 = 15.0
+                    const vHeight = 15.0;
+                    const vWidth = vHeight * camera.aspect;
+                    
+                    // Mirror X (1-x) and Invert Y (0.5-y)
+                    const worldX = (1 - pinchX - 0.5) * vWidth; 
+                    const worldY = -(pinchY - 0.5) * vHeight;
+                    
+                    STATE.dragTarget.set(worldX, worldY, 32);
+
+                    if (STATE.current !== 'FOCUS') {
+                        const photos = objects.filter(o => o.userData.type === 'photo');
+                        if (photos.length > 0) {
+                            // Pick random photo
+                            let randomPhoto;
+                            do {
+                                randomPhoto = photos[Math.floor(Math.random() * photos.length)];
+                            } while (randomPhoto === STATE.focusedObject && photos.length > 1);
+                            
+                            focusPhoto(randomPhoto);
+                        }
+                    }
+                } else {
+                    STATE.isDragging = false;
+                    // RELEASE: Close Photo
+                    if (STATE.current === 'FOCUS') {
+                        resetFocus();
+                    }
+
+                    // Shape Transformations (Only if not pinching)
+                    if (gesture === 'OPEN' && STATE.current !== 'CLOUD') {
+                        transformShape('CLOUD');
+                    } else if (gesture === 'FIST' && STATE.current !== 'TREE') {
+                        transformShape('TREE');
+                    }
+                }
+                
+                // Hide cursor as it is no longer used
+                cursor.style.display = 'none';
+
+            } else {
+                STATE.handDetected = false;
+                STATE.rotationSpeedY = 0.001; // Auto rotate slowly
+                STATE.rotationSpeedX = 0;
+                statusText.innerText = "No hand detected";
+                cursor.style.display = 'none';
+            }
+        }
+
+        // --- File Upload ---
+        const fileInput = document.getElementById('file-input');
+        fileInput.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            if(files.length === 0) return;
+
+            // Find photo objects
+            const photoObjects = objects.filter(o => o.userData.type === 'photo');
+            
+            files.forEach((file, i) => {
+                if(i >= photoObjects.length) return;
+                
+                const url = URL.createObjectURL(file);
+                const loader = new THREE.TextureLoader();
+                loader.load(url, (tex) => {
+                    tex.colorSpace = THREE.SRGBColorSpace;
+                    const newMat = new THREE.MeshBasicMaterial({ 
+                        map: tex, 
+                        side: THREE.DoubleSide,
+                        color: 0xaaaaaa // Dim the brightness
+                    });
+                    photoObjects[i].material = newMat;
+                });
+            });
+        });
+
+        // --- Main Loop ---
+        function animate(time) {
+            requestAnimationFrame(animate);
+            TWEEN.update(time);
+
+            // Apply LookAt
+            camera.lookAt(STATE.cameraTarget);
+
+            // Dragging Logic (Camera Panning)
+            if (STATE.current === 'FOCUS' && STATE.isDragging) {
+                // Hand movement (STATE.dragTarget) -> Camera Offset
+                // Invert logic: Hand moves Right -> Camera moves Left to pan view
+                const dragScale = 0.5; 
+                const targetX = STATE.baseCameraPos.x - STATE.dragTarget.x * dragScale;
+                const targetY = STATE.baseCameraPos.y - STATE.dragTarget.y * dragScale;
+
+                // Lerp camera (Slower factor for silkiness)
+                camera.position.x += (targetX - camera.position.x) * 0.02;
+                camera.position.y += (targetY - camera.position.y) * 0.02;
+            } else if (STATE.current === 'FOCUS' && !STATE.isDragging) {
+                // Return to base position when not dragging
+                camera.position.x += (STATE.baseCameraPos.x - camera.position.x) * 0.02;
+                camera.position.y += (STATE.baseCameraPos.y - camera.position.y) * 0.02;
+            }
+
+            // Billboard Effect: Make focused object always face camera
+            if (STATE.current === 'FOCUS' && STATE.focusedObject) {
+                const obj = STATE.focusedObject;
+                // Since obj is detached (in scene), simple lookAt works
+                obj.lookAt(camera.position);
+            }
+
+            // Rotate entire group (Only if not focused)
+            if (STATE.current !== 'FOCUS') {
+                objectGroup.rotation.y += STATE.rotationSpeedY;
+                objectGroup.rotation.x += STATE.rotationSpeedX;
+
+                // Auto-level tree if not in cloud mode (decay X rotation)
+                if (STATE.current === 'TREE') {
+                    objectGroup.rotation.x *= 0.95; 
+                    objectGroup.rotation.z *= 0.95;
+                }
+            } else {
+                // Slow rotation during focus for dynamic background
+                objectGroup.rotation.y += 0.0005; 
+            }
+
+            // Floating effect for cloud
+            if(STATE.current === 'CLOUD') {
+                const timeOffset = time * 0.001;
+                for(let i=0, l=objects.length; i<l; i++) {
+                    objects[i].position.y += Math.sin(timeOffset + i) * 0.01;
+                }
+            }
+
+            composer.render();
+        }
+
+        // --- Init ---
+        initParticles();
+        initVision();
+        animate();
+
+        // Resize Handler
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
